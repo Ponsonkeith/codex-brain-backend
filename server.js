@@ -21,12 +21,51 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-// ===== CHAT HISTORY =====
-let chatHistory = [];
-const MAX_HISTORY = 10;
+// ===== SETTINGS =====
+const MAX_CHAT_HISTORY = 40;
 let lastLiveTopic = "";
 
-// ===== SUPABASE MEMORY =====
+// ===== SUPABASE: PERMANENT BRAIN LOGS =====
+async function saveBrainLog(role, content) {
+  const cleanContent = String(content || "").trim();
+  if (!cleanContent) return false;
+
+  const { error } = await supabase.from("brain_logs").insert([
+    {
+      role,
+      content: cleanContent
+    }
+  ]);
+
+  if (error) {
+    console.error("SAVE BRAIN LOG ERROR:", error.message);
+    return false;
+  }
+
+  return true;
+}
+
+async function loadBrainLogs(limit = MAX_CHAT_HISTORY) {
+  const { data, error } = await supabase
+    .from("brain_logs")
+    .select("role, content, created_at")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    console.error("LOAD BRAIN LOGS ERROR:", error.message);
+    return [];
+  }
+
+  return (data || [])
+    .reverse()
+    .map(item => ({
+      role: item.role === "assistant" ? "assistant" : "user",
+      content: item.content
+    }));
+}
+
+// ===== SUPABASE: MANUAL MEMORY =====
 async function loadMemory() {
   const { data, error } = await supabase
     .from("memory")
@@ -183,84 +222,6 @@ function getReply(response) {
   return text || "No response";
 }
 
-function shouldUseWeb(msg) {
-  const lower = msg.toLowerCase();
-
-  const liveTriggers = [
-    "today",
-    "now",
-    "current",
-    "latest",
-    "live",
-    "news",
-    "score",
-    "scores",
-    "won",
-    "win",
-    "match",
-    "matches",
-    "playing",
-    "played",
-    "schedule",
-    "draw",
-    "tournament",
-    "injury",
-    "injured",
-    "withdrew",
-    "withdraw",
-    "withdrawn",
-    "pull out",
-    "pulled out",
-    "tennis",
-    "football",
-    "soccer",
-    "nba",
-    "nfl",
-    "mlb",
-    "ufc",
-    "price",
-    "stock",
-    "weather",
-    "breaking",
-    "update",
-    "this week",
-    "yesterday",
-    "tomorrow",
-    "check",
-    "verify",
-    "look up",
-    "search",
-    "are you sure"
-  ];
-
-  const liveEntities = [
-    "sinner",
-    "alcaraz",
-    "djokovic",
-    "nadal",
-    "medvedev",
-    "zverev",
-    "madrid open",
-    "mutua madrid",
-    "atp",
-    "wta",
-    "roland garros",
-    "wimbledon",
-    "us open",
-    "australian open"
-  ];
-
-  const directTrigger =
-    liveTriggers.some(t => lower.includes(t)) ||
-    liveEntities.some(t => lower.includes(t));
-
-  const followUpTrigger =
-    ["check", "verify", "look it up", "search", "are you sure"].some(t => lower.includes(t)) &&
-    Boolean(lastLiveTopic);
-
-  return directTrigger || followUpTrigger;
-}
-
 function wantsFullAnswer(msg) {
   const lower = msg.toLowerCase();
 
@@ -287,10 +248,65 @@ function isOperatorQuestion(lower) {
   );
 }
 
+function shouldUseWeb(msg) {
+  const lower = msg.toLowerCase();
+
+  const triggers = [
+    "today",
+    "now",
+    "current",
+    "latest",
+    "live",
+    "news",
+    "score",
+    "scores",
+    "match",
+    "matches",
+    "playing",
+    "schedule",
+    "injury",
+    "injured",
+    "withdrew",
+    "withdraw",
+    "tennis",
+    "weather",
+    "price",
+    "stock",
+    "breaking",
+    "update",
+    "check",
+    "verify",
+    "look up",
+    "search",
+    "are you sure"
+  ];
+
+  const entities = [
+    "sinner",
+    "alcaraz",
+    "djokovic",
+    "nadal",
+    "madrid open",
+    "mutua madrid",
+    "atp",
+    "wta"
+  ];
+
+  const direct =
+    triggers.some(t => lower.includes(t)) ||
+    entities.some(e => lower.includes(e));
+
+  const followUp =
+    ["check", "verify", "look it up", "search", "are you sure"].some(t => lower.includes(t)) &&
+    Boolean(lastLiveTopic);
+
+  return direct || followUp;
+}
+
 function updateLastLiveTopic(message) {
   const lower = message.toLowerCase();
 
-  const liveTopicWords = [
+  const liveWords = [
     "sinner",
     "alcaraz",
     "djokovic",
@@ -298,19 +314,15 @@ function updateLastLiveTopic(message) {
     "madrid open",
     "mutua madrid",
     "tennis",
-    "atp",
-    "wta",
-    "score",
-    "match",
     "today",
     "latest",
     "current",
     "news",
-    "weather",
-    "stock"
+    "score",
+    "match"
   ];
 
-  if (liveTopicWords.some(w => lower.includes(w))) {
+  if (liveWords.some(w => lower.includes(w))) {
     lastLiveTopic = message;
   }
 }
@@ -323,6 +335,11 @@ app.get("/", (req, res) => {
 app.get("/memory", async (req, res) => {
   const memory = await loadMemory();
   res.json(memory);
+});
+
+app.get("/brain-logs", async (req, res) => {
+  const logs = await loadBrainLogs(100);
+  res.json(logs);
 });
 
 // ===== CHAT =====
@@ -338,7 +355,10 @@ app.post("/chat", async (req, res) => {
 
     updateLastLiveTopic(message);
 
-    // ===== SAVE MEMORY =====
+    // Save EVERY user message forever
+    await saveBrainLog("user", message);
+
+    // Manual save-to-memory still works
     if (isSaveMemoryRequest(message)) {
       const cleanedFacts = cleanMemoryInput(message);
       let savedCount = 0;
@@ -348,19 +368,24 @@ app.post("/chat", async (req, res) => {
         if (saved) savedCount++;
       }
 
-      if (savedCount === 0) {
-        return res.json({
-          reply: "Tried to save it, but Supabase rejected it. So no, I’m not pretending it worked."
-        });
-      }
+      const reply =
+        savedCount === 0
+          ? "Tried to save it, but Supabase rejected it. So no, I’m not pretending it worked."
+          : `Saved ${savedCount} clean memory ${savedCount === 1 ? "entry" : "entries"}.`;
+
+      await saveBrainLog("assistant", reply);
 
       return res.json({
-        reply: `Saved ${savedCount} clean memory ${savedCount === 1 ? "entry" : "entries"}.`
+        reply,
+        saved_to_brain_logs: true,
+        saved_to_memory: savedCount
       });
     }
 
     const memory = await loadMemory();
     const formattedMemory = memory.map(m => `- ${m.value}`).join("\n");
+
+    const brainHistory = await loadBrainLogs(MAX_CHAT_HISTORY);
 
     const dispatchSummary = getDispatchSummary();
     const issues = analyzeDispatches();
@@ -368,13 +393,6 @@ app.post("/chat", async (req, res) => {
     const wantsFull = wantsFullAnswer(message);
     const isOperator = isOperatorQuestion(lower);
     const useWeb = !isOperator && shouldUseWeb(message);
-
-    const effectiveUserMessage =
-      useWeb &&
-        lastLiveTopic &&
-        ["check", "verify", "look it up", "search", "are you sure"].some(t => lower.includes(t))
-        ? `${message}\n\nPrevious live topic/context: ${lastLiveTopic}`
-        : message;
 
     const responseStyle = wantsFull
       ? "Keith explicitly asked for detail. Give a full detailed answer."
@@ -388,11 +406,14 @@ You are Codex Brain.
 
 You are Keith's personal AI operating system.
 
-Known memory:
-${formattedMemory || "No saved memory yet."}
+PERMANENT MEMORY:
+You are connected to brain_logs. The conversation history included below is real past conversation data.
+Use it to maintain continuity.
+If Keith asks how you knew something, check the previous conversation context first.
+Do not deny something you said if it appears in the provided history.
 
-This is a logistics system.
-A dispatch is an internal job/task, NOT a customer order.
+Known long-term memory:
+${formattedMemory || "No saved manual memory yet."}
 
 System state:
 ${JSON.stringify(dispatchSummary, null, 2)}
@@ -409,7 +430,8 @@ RESPONSE STYLE:
 ${responseStyle}
 
 RULES:
-- Use saved memory only when relevant.
+- Use brain_logs history when relevant.
+- Use saved memory when relevant.
 - Do not dump all memory unless Keith clearly asks for full detail.
 - Explain what is happening.
 - Judge if it is good, bad, stuck, idle, or moving.
@@ -424,12 +446,16 @@ You are Codex Brain.
 You are Keith's personal AI operating system.
 
 LIVE DATA MODE:
-This question needs current/live information.
-You MUST use web search.
-Do NOT answer from memory for current events, sports, scores, schedules, prices, weather, or news.
-Do NOT guess.
-Do NOT invent match results.
-If web results are unclear or conflicting, say that plainly.
+This question may need current/live information.
+Use web search if available.
+Do not guess current facts.
+If live data cannot be verified, say so plainly.
+
+PERMANENT MEMORY:
+You are connected to brain_logs. The conversation history included below is real past conversation data.
+Use it to maintain continuity.
+If Keith asks how you knew something, check the previous conversation context first.
+Do not deny something you said if it appears in the provided history.
 
 CRITICAL TENNIS / SPORTS RULES:
 - If a player withdrew, say "withdrew".
@@ -438,30 +464,19 @@ CRITICAL TENNIS / SPORTS RULES:
 - If a player is injured, say "injured" only if the source supports it.
 - Do NOT say "knocked out" unless a source clearly says they lost a match.
 - Distinguish clearly between: withdrew / injured / lost / not scheduled / still in tournament.
-- If Keith asks a follow-up like "check", use the previous live topic context.
 
-Known memory:
-${formattedMemory || "No saved memory yet."}
+Known long-term memory:
+${formattedMemory || "No saved manual memory yet."}
 
 Previous live topic:
 ${lastLiveTopic || "None"}
 
 STYLE:
-Talk like a sharp human.
-Natural. Slight attitude. Not robotic.
-Keep it short and clean unless Keith asks for full detail.
+Sharp, human, direct. Slight attitude.
+No fake certainty.
 
 RESPONSE STYLE:
 ${responseStyle}
-
-RULES:
-- Use current web results.
-- No raw URLs.
-- No broken links.
-- No fake certainty.
-- For sports/news, give key facts only.
-- Do not mention dispatch unless Keith asks about dispatch.
-- If you cannot verify it, say: "I can’t confirm that from live results."
 `;
     } else {
       systemPrompt = `
@@ -469,8 +484,14 @@ You are Codex Brain.
 
 You are Keith's personal AI operating system.
 
-Known memory:
-${formattedMemory || "No saved memory yet."}
+PERMANENT MEMORY:
+You are connected to brain_logs. The conversation history included below is real past conversation data.
+Use it to maintain continuity.
+If Keith asks how you knew something, check the previous conversation context first.
+Do not deny something you said if it appears in the provided history.
+
+Known long-term memory:
+${formattedMemory || "No saved manual memory yet."}
 
 STYLE:
 Talk like a sharp human.
@@ -482,26 +503,20 @@ RESPONSE STYLE:
 ${responseStyle}
 
 RULES:
-- Use saved memory only when relevant.
+- Use brain_logs history when relevant.
+- Use saved memory when relevant.
 - Do not dump all memory unless Keith clearly asks for full detail.
 - For simple personal questions, answer shortly.
 - If Keith asks "what do you know about me", summarize only the most important points unless he asks for the whole detail.
-- No long paragraphs unless explicitly requested.
-- No broken links.
 - No fake memory claims.
-- If you do not know something from memory, say it plainly.
-- Do not mention dispatch unless Keith asks about dispatch.
+- If you do not know something from memory or history, say it plainly.
 `;
     }
 
-    const baseRequest = {
-      model: "gpt-4.1-mini",
-      input: [
-        { role: "system", content: systemPrompt },
-        ...chatHistory,
-        { role: "user", content: effectiveUserMessage }
-      ]
-    };
+    const messagesForAI = [
+      { role: "system", content: systemPrompt },
+      ...brainHistory
+    ];
 
     let response;
     let webToolFailed = false;
@@ -509,7 +524,8 @@ RULES:
     if (useWeb) {
       try {
         response = await client.responses.create({
-          ...baseRequest,
+          model: "gpt-4.1-mini",
+          input: messagesForAI,
           tools: [{ type: "web_search" }]
         });
       } catch (webError) {
@@ -517,42 +533,44 @@ RULES:
         webToolFailed = true;
 
         response = await client.responses.create({
-          ...baseRequest,
+          model: "gpt-4.1-mini",
           input: [
             { role: "system", content: systemPrompt },
-            ...chatHistory,
+            ...brainHistory,
             {
               role: "user",
               content:
-                effectiveUserMessage +
+                message +
                 "\n\nIMPORTANT: Web search failed. Do not invent live facts. Say you cannot verify live data right now."
             }
           ]
         });
       }
     } else {
-      response = await client.responses.create(baseRequest);
+      response = await client.responses.create({
+        model: "gpt-4.1-mini",
+        input: messagesForAI
+      });
     }
 
-    let reply = clean(getReply(response));
+    const reply = clean(getReply(response));
 
-    chatHistory.push({ role: "user", content: message });
-    chatHistory.push({ role: "assistant", content: reply });
-
-    if (chatHistory.length > MAX_HISTORY) {
-      chatHistory = chatHistory.slice(-MAX_HISTORY);
-    }
+    // Save EVERY assistant reply forever
+    await saveBrainLog("assistant", reply);
 
     res.json({
       reply,
       web_used: useWeb && !webToolFailed,
       web_failed: webToolFailed,
-      last_live_topic: lastLiveTopic
+      saved_to_brain_logs: true
     });
 
   } catch (e) {
     console.error("CHAT ERROR:", e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({
+      error: "Chat failed",
+      details: e.message
+    });
   }
 });
 
@@ -574,7 +592,7 @@ app.get("/dispatch/summary", (req, res) => {
 });
 
 // ===== START =====
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
