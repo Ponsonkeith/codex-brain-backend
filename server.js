@@ -24,6 +24,7 @@ const supabase = createClient(
 // ===== CHAT HISTORY =====
 let chatHistory = [];
 const MAX_HISTORY = 10;
+let lastLiveTopic = "";
 
 // ===== SUPABASE MEMORY =====
 async function loadMemory() {
@@ -42,7 +43,6 @@ async function loadMemory() {
 
 async function saveMemory(value) {
   const cleanValue = String(value || "").trim();
-
   if (!cleanValue) return false;
 
   const { error } = await supabase
@@ -67,17 +67,11 @@ function cleanMemoryInput(message) {
     .replace(/store this[:\-]?/i, "")
     .trim();
 
-  // Remove excessive whitespace
   value = value.replace(/\s+/g, " ").trim();
 
-  // If user already wrote a clean short memory, save it as-is
-  if (value.length <= 220) {
-    return [value];
-  }
+  if (value.length <= 220) return [value];
 
-  // Split long memory into cleaner atomic facts using simple patterns
   const facts = [];
-
   const lower = value.toLowerCase();
 
   if (lower.includes("wife") && lower.includes("sofia")) {
@@ -108,12 +102,10 @@ function cleanMemoryInput(message) {
     facts.push("Codex Brain is my central AI operating system and control layer, not a dispatch system.");
   }
 
-  // If no clean facts were detected, save a compressed version instead of the whole bible
   if (facts.length === 0) {
     facts.push(value.slice(0, 280));
   }
 
-  // Remove duplicates
   return [...new Set(facts)];
 }
 
@@ -129,7 +121,7 @@ function isSaveMemoryRequest(msg) {
   );
 }
 
-// ===== DISPATCH SUMMARY =====
+// ===== DISPATCH =====
 function getDispatchSummary() {
   const all = dispatch.getAllDispatches();
 
@@ -143,7 +135,6 @@ function getDispatchSummary() {
   };
 }
 
-// ===== TIME ANALYSIS =====
 function analyzeDispatches() {
   const all = dispatch.getAllDispatches();
   const now = new Date();
@@ -174,26 +165,100 @@ function clean(text) {
   return String(text || "")
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
     .replace(/https?:\/\/\S+/g, "")
+    .replace(/\(\s*\)/g, "")
     .trim();
 }
 
-function getReply(r) {
-  if (r.output_text) return r.output_text;
+function getReply(response) {
+  if (response.output_text) return response.output_text;
 
-  let t = "";
-  r.output?.forEach(o => {
-    o.content?.forEach(c => {
-      if (c.text) t += c.text;
+  let text = "";
+
+  response.output?.forEach(item => {
+    item.content?.forEach(content => {
+      if (content.text) text += content.text;
     });
   });
 
-  return t || "No response";
+  return text || "No response";
 }
 
 function shouldUseWeb(msg) {
   const lower = msg.toLowerCase();
-  const triggers = ["today", "news", "latest", "score", "tennis", "current", "now", "won"];
-  return triggers.some(t => lower.includes(t));
+
+  const liveTriggers = [
+    "today",
+    "now",
+    "current",
+    "latest",
+    "live",
+    "news",
+    "score",
+    "scores",
+    "won",
+    "win",
+    "match",
+    "matches",
+    "playing",
+    "played",
+    "schedule",
+    "draw",
+    "tournament",
+    "injury",
+    "injured",
+    "withdrew",
+    "withdraw",
+    "withdrawn",
+    "pull out",
+    "pulled out",
+    "tennis",
+    "football",
+    "soccer",
+    "nba",
+    "nfl",
+    "mlb",
+    "ufc",
+    "price",
+    "stock",
+    "weather",
+    "breaking",
+    "update",
+    "this week",
+    "yesterday",
+    "tomorrow",
+    "check",
+    "verify",
+    "look up",
+    "search",
+    "are you sure"
+  ];
+
+  const liveEntities = [
+    "sinner",
+    "alcaraz",
+    "djokovic",
+    "nadal",
+    "medvedev",
+    "zverev",
+    "madrid open",
+    "mutua madrid",
+    "atp",
+    "wta",
+    "roland garros",
+    "wimbledon",
+    "us open",
+    "australian open"
+  ];
+
+  const directTrigger =
+    liveTriggers.some(t => lower.includes(t)) ||
+    liveEntities.some(t => lower.includes(t));
+
+  const followUpTrigger =
+    ["check", "verify", "look it up", "search", "are you sure"].some(t => lower.includes(t)) &&
+    Boolean(lastLiveTopic);
+
+  return directTrigger || followUpTrigger;
 }
 
 function wantsFullAnswer(msg) {
@@ -209,6 +274,45 @@ function wantsFullAnswer(msg) {
     lower.includes("whole damn detail") ||
     lower.includes("tell me all")
   );
+}
+
+function isOperatorQuestion(lower) {
+  return (
+    lower.includes("dispatch") ||
+    lower.includes("happening") ||
+    lower.includes("system status") ||
+    lower.includes("what should i do") ||
+    lower.includes("what should i focus") ||
+    lower.includes("what do i do")
+  );
+}
+
+function updateLastLiveTopic(message) {
+  const lower = message.toLowerCase();
+
+  const liveTopicWords = [
+    "sinner",
+    "alcaraz",
+    "djokovic",
+    "nadal",
+    "madrid open",
+    "mutua madrid",
+    "tennis",
+    "atp",
+    "wta",
+    "score",
+    "match",
+    "today",
+    "latest",
+    "current",
+    "news",
+    "weather",
+    "stock"
+  ];
+
+  if (liveTopicWords.some(w => lower.includes(w))) {
+    lastLiveTopic = message;
+  }
 }
 
 // ===== ROUTES =====
@@ -232,10 +336,11 @@ app.post("/chat", async (req, res) => {
 
     const lower = message.toLowerCase();
 
-    // ===== SAVE MEMORY CLEANLY =====
+    updateLastLiveTopic(message);
+
+    // ===== SAVE MEMORY =====
     if (isSaveMemoryRequest(message)) {
       const cleanedFacts = cleanMemoryInput(message);
-
       let savedCount = 0;
 
       for (const fact of cleanedFacts) {
@@ -245,12 +350,12 @@ app.post("/chat", async (req, res) => {
 
       if (savedCount === 0) {
         return res.json({
-          reply: "Tried to save it, but Supabase rejected it. So no, I’m not going to fake confidence like a clown."
+          reply: "Tried to save it, but Supabase rejected it. So no, I’m not pretending it worked."
         });
       }
 
       return res.json({
-        reply: `Saved ${savedCount} clean memory ${savedCount === 1 ? "entry" : "entries"}. No giant diary dump. We’re learning restraint, finally.`
+        reply: `Saved ${savedCount} clean memory ${savedCount === 1 ? "entry" : "entries"}.`
       });
     }
 
@@ -261,23 +366,22 @@ app.post("/chat", async (req, res) => {
     const issues = analyzeDispatches();
 
     const wantsFull = wantsFullAnswer(message);
+    const isOperator = isOperatorQuestion(lower);
+    const useWeb = !isOperator && shouldUseWeb(message);
+
+    const effectiveUserMessage =
+      useWeb &&
+        lastLiveTopic &&
+        ["check", "verify", "look it up", "search", "are you sure"].some(t => lower.includes(t))
+        ? `${message}\n\nPrevious live topic/context: ${lastLiveTopic}`
+        : message;
 
     const responseStyle = wantsFull
       ? "Keith explicitly asked for detail. Give a full detailed answer."
       : "Keep it short, sharp, and human. Do not dump the whole memory. No long speeches.";
 
-    const isOperator =
-      lower.includes("dispatch") ||
-      lower.includes("happening") ||
-      lower.includes("system") ||
-      lower.includes("status") ||
-      lower.includes("what should i do") ||
-      lower.includes("what should i focus") ||
-      lower.includes("what do i do");
-
     let systemPrompt;
 
-    // ===== OPERATOR MODE =====
     if (isOperator) {
       systemPrompt = `
 You are Codex Brain.
@@ -313,10 +417,53 @@ RULES:
 - Explain why.
 - No vague consultant garbage.
 `;
-    }
+    } else if (useWeb) {
+      systemPrompt = `
+You are Codex Brain.
 
-    // ===== GENERAL MODE =====
-    else {
+You are Keith's personal AI operating system.
+
+LIVE DATA MODE:
+This question needs current/live information.
+You MUST use web search.
+Do NOT answer from memory for current events, sports, scores, schedules, prices, weather, or news.
+Do NOT guess.
+Do NOT invent match results.
+If web results are unclear or conflicting, say that plainly.
+
+CRITICAL TENNIS / SPORTS RULES:
+- If a player withdrew, say "withdrew".
+- If a player lost a match, say "lost".
+- If a player is not scheduled, say "not scheduled".
+- If a player is injured, say "injured" only if the source supports it.
+- Do NOT say "knocked out" unless a source clearly says they lost a match.
+- Distinguish clearly between: withdrew / injured / lost / not scheduled / still in tournament.
+- If Keith asks a follow-up like "check", use the previous live topic context.
+
+Known memory:
+${formattedMemory || "No saved memory yet."}
+
+Previous live topic:
+${lastLiveTopic || "None"}
+
+STYLE:
+Talk like a sharp human.
+Natural. Slight attitude. Not robotic.
+Keep it short and clean unless Keith asks for full detail.
+
+RESPONSE STYLE:
+${responseStyle}
+
+RULES:
+- Use current web results.
+- No raw URLs.
+- No broken links.
+- No fake certainty.
+- For sports/news, give key facts only.
+- Do not mention dispatch unless Keith asks about dispatch.
+- If you cannot verify it, say: "I can’t confirm that from live results."
+`;
+    } else {
       systemPrompt = `
 You are Codex Brain.
 
@@ -343,23 +490,49 @@ RULES:
 - No broken links.
 - No fake memory claims.
 - If you do not know something from memory, say it plainly.
+- Do not mention dispatch unless Keith asks about dispatch.
 `;
     }
 
-    const request = {
+    const baseRequest = {
       model: "gpt-4.1-mini",
       input: [
         { role: "system", content: systemPrompt },
         ...chatHistory,
-        { role: "user", content: message }
+        { role: "user", content: effectiveUserMessage }
       ]
     };
 
-    if (!isOperator && shouldUseWeb(message)) {
-      request.tools = [{ type: "web_search_preview" }];
-    }
+    let response;
+    let webToolFailed = false;
 
-    const response = await client.responses.create(request);
+    if (useWeb) {
+      try {
+        response = await client.responses.create({
+          ...baseRequest,
+          tools: [{ type: "web_search" }]
+        });
+      } catch (webError) {
+        console.error("WEB SEARCH ERROR:", webError.message);
+        webToolFailed = true;
+
+        response = await client.responses.create({
+          ...baseRequest,
+          input: [
+            { role: "system", content: systemPrompt },
+            ...chatHistory,
+            {
+              role: "user",
+              content:
+                effectiveUserMessage +
+                "\n\nIMPORTANT: Web search failed. Do not invent live facts. Say you cannot verify live data right now."
+            }
+          ]
+        });
+      }
+    } else {
+      response = await client.responses.create(baseRequest);
+    }
 
     let reply = clean(getReply(response));
 
@@ -370,7 +543,12 @@ RULES:
       chatHistory = chatHistory.slice(-MAX_HISTORY);
     }
 
-    res.json({ reply });
+    res.json({
+      reply,
+      web_used: useWeb && !webToolFailed,
+      web_failed: webToolFailed,
+      last_live_topic: lastLiveTopic
+    });
 
   } catch (e) {
     console.error("CHAT ERROR:", e);
