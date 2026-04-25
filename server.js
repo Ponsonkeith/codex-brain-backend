@@ -21,7 +21,7 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-// ===== CHAT MEMORY =====
+// ===== CHAT HISTORY =====
 let chatHistory = [];
 const MAX_HISTORY = 10;
 
@@ -55,6 +55,78 @@ async function saveMemory(value) {
   }
 
   return true;
+}
+
+// ===== MEMORY CLEANER =====
+function cleanMemoryInput(message) {
+  let value = String(message || "")
+    .replace(/save this to memory[:\-]?/i, "")
+    .replace(/save to memory[:\-]?/i, "")
+    .replace(/remember this[:\-]?/i, "")
+    .replace(/remember that[:\-]?/i, "")
+    .replace(/store this[:\-]?/i, "")
+    .trim();
+
+  // Remove excessive whitespace
+  value = value.replace(/\s+/g, " ").trim();
+
+  // If user already wrote a clean short memory, save it as-is
+  if (value.length <= 220) {
+    return [value];
+  }
+
+  // Split long memory into cleaner atomic facts using simple patterns
+  const facts = [];
+
+  const lower = value.toLowerCase();
+
+  if (lower.includes("wife") && lower.includes("sofia")) {
+    facts.push("My wife is Sofia Grishchenko.");
+  }
+
+  if (lower.includes("no longer have feelings") || lower.includes("no feelings")) {
+    facts.push("I have said I no longer have feelings for my wife.");
+  }
+
+  if (lower.includes("son") && lower.includes("eli")) {
+    facts.push("My son is named Eli.");
+  }
+
+  if (lower.includes("hate slow") || lower.includes("wasted time")) {
+    facts.push("I hate slow systems and wasted time.");
+  }
+
+  if (lower.includes("makes me happy") || lower.includes("happy")) {
+    facts.push("What makes me happy is control, fast progress, building useful systems, and seeing proof that things work.");
+  }
+
+  if (lower.includes("overbuild")) {
+    facts.push("I tend to overbuild before validating.");
+  }
+
+  if (lower.includes("codex brain")) {
+    facts.push("Codex Brain is my central AI operating system and control layer, not a dispatch system.");
+  }
+
+  // If no clean facts were detected, save a compressed version instead of the whole bible
+  if (facts.length === 0) {
+    facts.push(value.slice(0, 280));
+  }
+
+  // Remove duplicates
+  return [...new Set(facts)];
+}
+
+function isSaveMemoryRequest(msg) {
+  const lower = msg.toLowerCase();
+
+  return (
+    lower.includes("save to memory") ||
+    lower.includes("save this to memory") ||
+    lower.includes("remember this") ||
+    lower.includes("remember that") ||
+    lower.includes("store this")
+  );
 }
 
 // ===== DISPATCH SUMMARY =====
@@ -134,30 +206,9 @@ function wantsFullAnswer(msg) {
     lower.includes("full analysis") ||
     lower.includes("complete breakdown") ||
     lower.includes("whole detail") ||
-    lower.includes("whole damn detail")
+    lower.includes("whole damn detail") ||
+    lower.includes("tell me all")
   );
-}
-
-function isSaveMemoryRequest(msg) {
-  const lower = msg.toLowerCase();
-
-  return (
-    lower.includes("save to memory") ||
-    lower.includes("save this to memory") ||
-    lower.includes("remember this") ||
-    lower.includes("remember that") ||
-    lower.includes("store this")
-  );
-}
-
-function extractMemoryValue(msg) {
-  return String(msg)
-    .replace(/save this to memory[:\-]?/i, "")
-    .replace(/save to memory[:\-]?/i, "")
-    .replace(/remember this[:\-]?/i, "")
-    .replace(/remember that[:\-]?/i, "")
-    .replace(/store this[:\-]?/i, "")
-    .trim();
 }
 
 // ===== ROUTES =====
@@ -181,19 +232,25 @@ app.post("/chat", async (req, res) => {
 
     const lower = message.toLowerCase();
 
-    // ===== SAVE MEMORY ALWAYS =====
+    // ===== SAVE MEMORY CLEANLY =====
     if (isSaveMemoryRequest(message)) {
-      const value = extractMemoryValue(message);
-      const saved = await saveMemory(value);
+      const cleanedFacts = cleanMemoryInput(message);
 
-      if (!saved) {
+      let savedCount = 0;
+
+      for (const fact of cleanedFacts) {
+        const saved = await saveMemory(fact);
+        if (saved) savedCount++;
+      }
+
+      if (savedCount === 0) {
         return res.json({
-          reply: "Tried to save it, but Supabase rejected it. So no, I’m not going to lie and pretend it worked."
+          reply: "Tried to save it, but Supabase rejected it. So no, I’m not going to fake confidence like a clown."
         });
       }
 
       return res.json({
-        reply: "Saved. Now it’s actually in memory, not floating around in imaginary robot confidence."
+        reply: `Saved ${savedCount} clean memory ${savedCount === 1 ? "entry" : "entries"}. No giant diary dump. We’re learning restraint, finally.`
       });
     }
 
@@ -206,7 +263,7 @@ app.post("/chat", async (req, res) => {
     const wantsFull = wantsFullAnswer(message);
 
     const responseStyle = wantsFull
-      ? "Give a full detailed answer because Keith explicitly asked for detail."
+      ? "Keith explicitly asked for detail. Give a full detailed answer."
       : "Keep it short, sharp, and human. Do not dump the whole memory. No long speeches.";
 
     const isOperator =
@@ -248,8 +305,8 @@ RESPONSE STYLE:
 ${responseStyle}
 
 RULES:
-- Use saved memory when relevant.
-- Do not dump all memory unless Keith asks for full detail.
+- Use saved memory only when relevant.
+- Do not dump all memory unless Keith clearly asks for full detail.
 - Explain what is happening.
 - Judge if it is good, bad, stuck, idle, or moving.
 - Give ONE action.
@@ -278,8 +335,8 @@ RESPONSE STYLE:
 ${responseStyle}
 
 RULES:
-- Use saved memory when relevant.
-- Do not dump all memory unless Keith asks for full detail.
+- Use saved memory only when relevant.
+- Do not dump all memory unless Keith clearly asks for full detail.
 - For simple personal questions, answer shortly.
 - If Keith asks "what do you know about me", summarize only the most important points unless he asks for the whole detail.
 - No long paragraphs unless explicitly requested.
@@ -339,6 +396,8 @@ app.get("/dispatch/summary", (req, res) => {
 });
 
 // ===== START =====
-app.listen(3000, () => {
-  console.log("Server running on port 3000");
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
