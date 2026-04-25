@@ -1,0 +1,4 @@
+{
+  "type": "profile",
+  "value": "full personal profile text..."
+}
