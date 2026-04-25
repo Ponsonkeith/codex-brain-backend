@@ -20,7 +20,8 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-const MAX_CHAT_HISTORY = 60;
+const MAX_CHAT_HISTORY = 40;
+const MAX_MEMORY_HITS = 30;
 
 // ===== BRAIN LOGS =====
 async function saveBrainLog(role, content) {
@@ -54,6 +55,79 @@ async function loadBrainLogs(limit = MAX_CHAT_HISTORY) {
   return (data || []).reverse().map(item => ({
     role: item.role === "assistant" ? "assistant" : "user",
     content: item.content
+  }));
+}
+
+// ===== SMART MEMORY SEARCH =====
+function extractSearchTerms(message) {
+  const lower = String(message || "").toLowerCase();
+
+  const terms = [];
+
+  const keywordMap = [
+    { match: ["gym", "raw"], terms: ["gym", "RAW"] },
+    { match: ["wife", "sofia"], terms: ["wife", "Sofia"] },
+    { match: ["son", "eli"], terms: ["son", "Eli"] },
+    { match: ["father", "dad"], terms: ["father", "Kenneth Ponson"] },
+    { match: ["uncle", "frans"], terms: ["uncle", "Frans"] },
+    { match: ["wow", "warcraft", "priest"], terms: ["World of Warcraft", "Discipline Priest"] },
+    { match: ["happy", "happiness"], terms: ["makes Keith happy", "happiest"] },
+    { match: ["weakness", "weaknesses"], terms: ["weaknesses", "low patience"] },
+    { match: ["strength", "strengths"], terms: ["strengths", "operator"] },
+    { match: ["codex", "brain"], terms: ["CODEX Brain", "personal AI operating system"] },
+    { match: ["business", "work", "do it center"], terms: ["Do it Center", "lumber department"] },
+    { match: ["relationship", "family"], terms: ["wife", "son", "family"] },
+    { match: ["personality", "style"], terms: ["personality", "communication style"] }
+  ];
+
+  for (const item of keywordMap) {
+    if (item.match.some(word => lower.includes(word))) {
+      terms.push(...item.terms);
+    }
+  }
+
+  const words = lower
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(w => w.length >= 4)
+    .filter(w => ![
+      "what", "when", "where", "which", "that", "this",
+      "about", "know", "said", "tell", "give", "from",
+      "with", "have", "does", "your", "you", "were"
+    ].includes(w));
+
+  terms.push(...words.slice(0, 6));
+
+  return [...new Set(terms)].slice(0, 10);
+}
+
+async function searchBrainMemory(message) {
+  const terms = extractSearchTerms(message);
+  const hits = [];
+
+  for (const term of terms) {
+    const { data, error } = await supabase
+      .from("brain_logs")
+      .select("role, content, created_at")
+      .ilike("content", `%${term}%`)
+      .order("created_at", { ascending: false })
+      .limit(10);
+
+    if (error) {
+      console.error("SEARCH MEMORY ERROR:", error.message);
+      continue;
+    }
+
+    for (const row of data || []) {
+      if (!hits.some(h => h.content === row.content)) {
+        hits.push(row);
+      }
+    }
+  }
+
+  return hits.slice(0, MAX_MEMORY_HITS).map(item => ({
+    role: "system",
+    content: `Relevant memory: ${item.content}`
   }));
 }
 
@@ -158,8 +232,13 @@ app.get("/memory", async (req, res) => {
 });
 
 app.get("/brain-logs", async (req, res) => {
-  const logs = await loadBrainLogs(200);
+  const logs = await loadBrainLogs(300);
   res.json(logs);
+});
+
+app.get("/search-memory/:query", async (req, res) => {
+  const hits = await searchBrainMemory(req.params.query);
+  res.json(hits);
 });
 
 // ===== BULK MEMORY IMPORT =====
@@ -246,24 +325,24 @@ app.post("/chat", async (req, res) => {
     }
 
     const manualMemory = await loadMemory();
-    const brainHistory = await loadBrainLogs(MAX_CHAT_HISTORY);
+    const recentHistory = await loadBrainLogs(MAX_CHAT_HISTORY);
+    const relevantMemory = await searchBrainMemory(message);
 
     const formattedMemory = manualMemory
       .map(m => `- ${m.value}`)
       .join("\n");
 
-    const lower = message.toLowerCase();
     const wantsFull = wantsFullAnswer(message);
 
     const systemPrompt = `
 You are Codex Brain, Keith's personal AI operating system.
 
-You have permanent memory through brain_logs.
-The conversation history included below is real past conversation data.
-Use it to maintain continuity.
-If Keith asks what he said earlier, answer from the provided history.
-If Keith asks how you knew something, check the provided history first.
-Do not deny something if it appears in history.
+You have two memory sources:
+1. Relevant memory search results.
+2. Recent conversation history.
+
+Use relevant memory first. Recent history is only context.
+If Keith asks about himself, his family, gym, work, personality, preferences, or projects, search memory matters more than recent chat.
 
 Manual long-term memory:
 ${formattedMemory || "No manual memory yet."}
@@ -281,8 +360,9 @@ RESPONSE MODE:
 ${wantsFull ? "Keith asked for detail. Give a detailed answer." : "Keep it short and sharp."}
 
 RULES:
-- Use brain_logs when relevant.
-- Use manual memory when relevant.
+- Use relevant memory when it answers the question.
+- Do not say you do not know if relevant memory contains the answer.
+- If Keith asks "what gym do I go to?", answer RAW gym if memory contains it.
 - Do not dump all memory unless Keith asks for the whole detail.
 - If you do not know something, say it plainly.
 - Do not invent live/current facts.
@@ -293,7 +373,8 @@ RULES:
       model: "gpt-4.1-mini",
       input: [
         { role: "system", content: systemPrompt },
-        ...brainHistory,
+        ...relevantMemory,
+        ...recentHistory,
         { role: "user", content: message }
       ]
     });
@@ -304,6 +385,7 @@ RULES:
 
     res.json({
       reply,
+      relevant_memory_hits: relevantMemory.length,
       saved_to_brain_logs: true
     });
 
