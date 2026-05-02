@@ -1,423 +1,781 @@
 import express from "express";
-import OpenAI from "openai";
 import cors from "cors";
 import dotenv from "dotenv";
-import { createClient } from "@supabase/supabase-js";
-import dispatch from "./dispatch.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createRequire } from "module";
+import OpenAI from "openai";
 
 dotenv.config();
 
+const require = createRequire(import.meta.url);
+const { loadMemory, searchMemory, buildMemoryContext } = require("./memorySearch.cjs");
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
+
+const PORT = process.env.PORT || 3000;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
+const LOCAL_MEMORY_FILE = path.join(__dirname, "memory.json");
+const PROFILE_FILE = path.join(__dirname, "keith_profile.txt");
+const DATA_MEMORY_FILE = path.join(__dirname, "data", "chatgpt-memory.jsonl");
 
-const MAX_CHAT_HISTORY = 40;
-const MAX_MEMORY_HITS = 30;
+function safeReadText(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return "";
+    return fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    console.error("Failed reading text file:", filePath, error.message);
+    return "";
+  }
+}
 
-// ===== BRAIN LOGS =====
-async function saveBrainLog(role, content) {
-  const cleanContent = String(content || "").trim();
-  if (!cleanContent) return false;
+function safeReadJson(filePath, fallback = null) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
 
-  const { error } = await supabase.from("brain_logs").insert([
-    { role, content: cleanContent }
-  ]);
+    const raw = fs.readFileSync(filePath, "utf8");
 
-  if (error) {
-    console.error("SAVE BRAIN LOG ERROR:", error.message);
+    if (!raw.trim()) return fallback;
+
+    return JSON.parse(raw);
+  } catch (error) {
+    console.error("Failed reading JSON file:", filePath, error.message);
+    return fallback;
+  }
+}
+
+function safeWriteJson(filePath, data) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
+    return true;
+  } catch (error) {
+    console.error("Failed writing JSON file:", filePath, error.message);
     return false;
   }
-
-  return true;
 }
 
-async function loadBrainLogs(limit = MAX_CHAT_HISTORY) {
-  const { data, error } = await supabase
-    .from("brain_logs")
-    .select("role, content, created_at")
-    .order("created_at", { ascending: false })
-    .limit(limit);
+function limitText(text, maxChars = 12000) {
+  const value = String(text || "");
 
-  if (error) {
-    console.error("LOAD BRAIN LOGS ERROR:", error.message);
-    return [];
+  if (value.length <= maxChars) {
+    return value;
   }
 
-  return (data || []).reverse().map(item => ({
-    role: item.role === "assistant" ? "assistant" : "user",
-    content: item.content
-  }));
+  return value.slice(0, maxChars) + "\n\n[TRUNCATED]";
 }
 
-// ===== SMART MEMORY SEARCH =====
-function extractSearchTerms(message) {
-  const lower = String(message || "").toLowerCase();
+function getLocalMemoryContext() {
+  const parts = [];
 
-  const terms = [];
+  const profile = safeReadText(PROFILE_FILE);
 
-  const keywordMap = [
-    { match: ["gym", "raw"], terms: ["gym", "RAW"] },
-    { match: ["wife", "sofia"], terms: ["wife", "Sofia"] },
-    { match: ["son", "eli"], terms: ["son", "Eli"] },
-    { match: ["father", "dad"], terms: ["father", "Kenneth Ponson"] },
-    { match: ["uncle", "frans"], terms: ["uncle", "Frans"] },
-    { match: ["wow", "warcraft", "priest"], terms: ["World of Warcraft", "Discipline Priest"] },
-    { match: ["happy", "happiness"], terms: ["makes Keith happy", "happiest"] },
-    { match: ["weakness", "weaknesses"], terms: ["weaknesses", "low patience"] },
-    { match: ["strength", "strengths"], terms: ["strengths", "operator"] },
-    { match: ["codex", "brain"], terms: ["CODEX Brain", "personal AI operating system"] },
-    { match: ["business", "work", "do it center"], terms: ["Do it Center", "lumber department"] },
-    { match: ["relationship", "family"], terms: ["wife", "son", "family"] },
-    { match: ["personality", "style"], terms: ["personality", "communication style"] }
+  if (profile.trim()) {
+    parts.push("LOCAL PROFILE:\n" + limitText(profile, 4000));
+  }
+
+  const localMemory = safeReadJson(LOCAL_MEMORY_FILE, null);
+
+  if (localMemory) {
+    let memoryText = "";
+
+    if (Array.isArray(localMemory)) {
+      memoryText = localMemory
+        .slice(-50)
+        .map((item, index) => {
+          if (typeof item === "string") {
+            return `${index + 1}. ${item}`;
+          }
+
+          return `${index + 1}. ${JSON.stringify(item)}`;
+        })
+        .join("\n");
+    } else {
+      memoryText = JSON.stringify(localMemory, null, 2);
+    }
+
+    if (memoryText.trim()) {
+      parts.push("LOCAL SAVED MEMORY:\n" + limitText(memoryText, 8000));
+    }
+  }
+
+  return parts.join("\n\n---\n\n");
+}
+
+function extractUserMessage(body) {
+  if (!body || typeof body !== "object") {
+    return "";
+  }
+
+  return (
+    body.message ||
+    body.input ||
+    body.prompt ||
+    body.text ||
+    body.question ||
+    ""
+  ).toString();
+}
+
+function shouldUseMemory(message, results) {
+  const text = String(message || "").toLowerCase();
+
+  const memoryTriggers = [
+    "where did we leave off",
+    "what did we decide",
+    "what did i decide",
+    "what was the plan",
+    "what was my plan",
+    "where are we with",
+    "where were we",
+    "past chat",
+    "past chats",
+    "previous chat",
+    "last time",
+    "remember",
+    "recall",
+    "codex brain",
+    "brain 297",
+    "operator brain",
+    "codex core",
+    "x7",
+    "dispatch",
+    "driver portal",
+    "arc league",
+    "aruba racquet club",
+    "real estate",
+    "estateos",
+    "neuralyx",
+    "pos",
+    "cash count",
+    "alprazolam",
+    "taper",
+    "mounjaro",
+    "hotel",
+    "daher",
+    "vanguard",
+    "website",
+    "codex",
+    "do it center",
+    "super do it center",
+    "hr system",
+    "recruitment",
+    "vacancy"
   ];
 
-  for (const item of keywordMap) {
-    if (item.match.some(word => lower.includes(word))) {
-      terms.push(...item.terms);
-    }
-  }
+  const triggered = memoryTriggers.some((trigger) => text.includes(trigger));
 
-  const words = lower
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter(w => w.length >= 4)
-    .filter(w => ![
-      "what", "when", "where", "which", "that", "this",
-      "about", "know", "said", "tell", "give", "from",
-      "with", "have", "does", "your", "you", "were"
-    ].includes(w));
+  const hasStrongResult =
+    Array.isArray(results) &&
+    results.some((result) => Number(result.score || 0) >= 12);
 
-  terms.push(...words.slice(0, 6));
-
-  return [...new Set(terms)].slice(0, 10);
+  return triggered || hasStrongResult;
 }
 
-async function searchBrainMemory(message) {
-  const terms = extractSearchTerms(message);
-  const hits = [];
-
-  for (const term of terms) {
-    const { data, error } = await supabase
-      .from("brain_logs")
-      .select("role, content, created_at")
-      .ilike("content", `%${term}%`)
-      .order("created_at", { ascending: false })
-      .limit(10);
-
-    if (error) {
-      console.error("SEARCH MEMORY ERROR:", error.message);
-      continue;
-    }
-
-    for (const row of data || []) {
-      if (!hits.some(h => h.content === row.content)) {
-        hits.push(row);
-      }
-    }
-  }
-
-  return hits.slice(0, MAX_MEMORY_HITS).map(item => ({
-    role: "system",
-    content: `Relevant memory: ${item.content}`
-  }));
+function buildRuntimeContext({ memoryResultsCount, memoryUsed }) {
+  return `
+RUNTIME CURRENT STATE:
+- This server.js file is running because the request reached the backend successfully.
+- Codex Brain backend is active on port ${PORT}.
+- OpenAI key loaded: ${Boolean(process.env.OPENAI_API_KEY)}.
+- ChatGPT memory archive file exists: ${fs.existsSync(DATA_MEMORY_FILE)}.
+- Local memory file exists: ${fs.existsSync(LOCAL_MEMORY_FILE)}.
+- Memory search was executed for this request.
+- Memory results found for this request: ${memoryResultsCount}.
+- Retrieved memory was injected into the AI context for this request: ${memoryUsed}.
+- If historical retrieved memory says the system is not built yet, treat that as outdated when runtime state proves the system is now running.
+`.trim();
 }
 
-// ===== MANUAL MEMORY =====
-async function loadMemory() {
-  const { data, error } = await supabase
-    .from("memory")
-    .select("*")
-    .order("created_at", { ascending: true });
+function buildSystemPrompt({
+  runtimeContext,
+  localMemoryContext,
+  retrievedMemoryContext
+}) {
+  return `
+You are Codex Brain, Keith's operator assistant.
 
-  if (error) {
-    console.error("LOAD MEMORY ERROR:", error.message);
-    return [];
-  }
+Core behavior:
+- Answer directly.
+- Be practical, sharp, and execution-focused.
+- Use retrieved memory only when it is relevant.
+- Do not pretend to remember something unless it appears in the provided memory context.
+- Do not invent past decisions.
+- Do not over-explain unless the user asks for depth.
+- Do not end responses with follow-up questions.
+- Do not say "Want me to..." or ask permission to continue.
+- Do not end with "I can help..." or "let me know."
+- If there is an obvious next step, give the next step directly.
+- Be concise unless the user asks for a full plan.
 
-  return data || [];
+Keith prefers:
+- direct answers
+- no fluff
+- ruthless logic
+- practical steps
+- no fake confidence
+- no soft chatbot behavior
+- clear next actions
+
+Memory priority rules:
+1. RUNTIME CURRENT STATE is the highest priority.
+2. LOCAL SAVED MEMORY is second priority.
+3. RETRIEVED PAST CHAT MEMORY is historical context and may be outdated.
+4. If retrieved memory conflicts with runtime state or local memory, prioritize runtime state and local memory.
+5. Do not say something is not built if runtime state proves it is already working.
+6. If memory results are weak, say the memory is not strong enough and answer normally.
+
+For "where did we leave off" questions, answer in this structure:
+1. Current confirmed state
+2. Relevant retrieved memory
+3. Next concrete action
+
+When using retrieved memory:
+- Do not dump raw memory unless the user asks for raw details.
+- Summarize what matters.
+- Separate confirmed memory from your recommended next step.
+- Keep it concise unless the question requires more detail.
+
+${runtimeContext ? `\n${runtimeContext}\n` : ""}
+
+${localMemoryContext ? `\nLOCAL CONTEXT:\n${localMemoryContext}\n` : ""}
+
+${retrievedMemoryContext ? `\nRETRIEVED PAST CHAT MEMORY:\n${retrievedMemoryContext}\n` : ""}
+`.trim();
 }
 
-async function saveMemory(value) {
-  const cleanValue = String(value || "").trim();
-  if (!cleanValue) return false;
-
-  const { error } = await supabase
-    .from("memory")
-    .insert([{ value: cleanValue }]);
-
-  if (error) {
-    console.error("SAVE MEMORY ERROR:", error.message);
-    return false;
-  }
-
-  return true;
-}
-
-function isSaveMemoryRequest(msg) {
-  const lower = msg.toLowerCase();
-  return (
-    lower.includes("save to memory") ||
-    lower.includes("save this to memory") ||
-    lower.includes("remember this") ||
-    lower.includes("remember that") ||
-    lower.includes("store this")
-  );
-}
-
-// ===== HELPERS =====
-function clean(text) {
-  return String(text || "")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
-    .replace(/https?:\/\/\S+/g, "")
-    .replace(/\(\s*\)/g, "")
-    .trim();
-}
-
-function getReply(response) {
-  if (response.output_text) return response.output_text;
-
-  let text = "";
-  response.output?.forEach(item => {
-    item.content?.forEach(content => {
-      if (content.text) text += content.text;
-    });
-  });
-
-  return text || "No response";
-}
-
-function wantsFullAnswer(msg) {
-  const lower = msg.toLowerCase();
-  return (
-    lower.includes("full detail") ||
-    lower.includes("full details") ||
-    lower.includes("everything") ||
-    lower.includes("complete breakdown") ||
-    lower.includes("whole detail") ||
-    lower.includes("tell me all")
-  );
-}
-
-// ===== DISPATCH =====
-function getDispatchSummary() {
-  const all = dispatch.getAllDispatches();
-
-  return {
-    total: all.length,
-    pending: all.filter(d => d.status === "Pending").length,
-    scheduled: all.filter(d => d.status === "Scheduled").length,
-    outForDelivery: all.filter(d => d.status === "Out for Delivery").length,
-    delivered: all.filter(d => d.status === "Delivered").length,
-    cancelled: all.filter(d => d.status === "Cancelled").length
-  };
-}
-
-// ===== ROUTES =====
-app.get("/", (req, res) => {
-  res.send("Codex Brain running");
-});
-
-app.get("/memory", async (req, res) => {
-  const memory = await loadMemory();
-  res.json(memory);
-});
-
-app.get("/brain-logs", async (req, res) => {
-  const logs = await loadBrainLogs(300);
-  res.json(logs);
-});
-
-app.get("/search-memory/:query", async (req, res) => {
-  const hits = await searchBrainMemory(req.params.query);
-  res.json(hits);
-});
-
-// ===== BULK MEMORY IMPORT =====
-app.post("/bulk-memory", async (req, res) => {
+async function handleChat(req, res) {
   try {
-    const { entries, text } = req.body;
+    const userMessage = extractUserMessage(req.body);
 
-    let finalEntries = [];
-
-    if (Array.isArray(entries)) {
-      finalEntries = entries;
-    } else if (typeof text === "string") {
-      finalEntries = text
-        .split(/\r?\n/)
-        .map(line => line.trim())
-        .filter(line => line.length > 0);
-    } else {
+    if (!userMessage) {
       return res.status(400).json({
-        error: "Send either { entries: [...] } or { text: 'line 1\\nline 2' }"
+        ok: false,
+        error: "Missing message"
       });
     }
 
-    finalEntries = finalEntries
-      .map(e => String(e).trim())
-      .filter(e => e.length > 0);
-
-    if (finalEntries.length === 0) {
-      return res.status(400).json({ error: "No valid memory entries found" });
+    if (!openai) {
+      return res.status(500).json({
+        ok: false,
+        error: "OPENAI_API_KEY is missing in .env"
+      });
     }
 
-    const payload = finalEntries.map(entry => ({
-      role: "user",
-      content: entry
-    }));
+    console.log("Chat request:", userMessage);
 
-    const { error } = await supabase
-      .from("brain_logs")
-      .insert(payload);
+    let memoryResults = [];
+    let memoryContext = "";
+    let memoryUsed = false;
 
-    if (error) {
-      console.error("BULK MEMORY ERROR:", error.message);
-      return res.status(500).json({ error: error.message });
+    try {
+      memoryResults = searchMemory(userMessage, 8);
+
+      console.log(`Memory search for: ${userMessage}`);
+      console.log(`Found ${memoryResults.length} memory results`);
+
+      const strongResults = memoryResults
+        .filter((result) => Number(result.score || 0) >= 8)
+        .slice(0, 8);
+
+      if (shouldUseMemory(userMessage, strongResults)) {
+        memoryContext = buildMemoryContext(strongResults);
+        memoryContext = limitText(memoryContext, 14000);
+        memoryUsed = Boolean(memoryContext);
+      }
+    } catch (memoryError) {
+      console.error("Memory retrieval failed:", memoryError.message);
     }
 
-    res.json({
-      success: true,
-      inserted: payload.length
+    const localMemoryContext = getLocalMemoryContext();
+
+    const runtimeContext = buildRuntimeContext({
+      memoryResultsCount: memoryResults.length,
+      memoryUsed
     });
 
-  } catch (err) {
-    console.error("BULK MEMORY SERVER ERROR:", err);
-    res.status(500).json({ error: "Bulk memory failed" });
-  }
-});
-
-// ===== CHAT =====
-app.post("/chat", async (req, res) => {
-  try {
-    const { message } = req.body;
-
-    if (!message) {
-      return res.status(400).json({ error: "No message provided" });
-    }
-
-    await saveBrainLog("user", message);
-
-    if (isSaveMemoryRequest(message)) {
-      const cleaned = message
-        .replace(/save this to memory[:\-]?/i, "")
-        .replace(/save to memory[:\-]?/i, "")
-        .replace(/remember this[:\-]?/i, "")
-        .replace(/remember that[:\-]?/i, "")
-        .replace(/store this[:\-]?/i, "")
-        .trim();
-
-      const saved = await saveMemory(cleaned);
-
-      const reply = saved
-        ? "Saved to memory."
-        : "Tried to save it, but Supabase rejected it.";
-
-      await saveBrainLog("assistant", reply);
-      return res.json({ reply });
-    }
-
-    const manualMemory = await loadMemory();
-    const recentHistory = await loadBrainLogs(MAX_CHAT_HISTORY);
-    const relevantMemory = await searchBrainMemory(message);
-
-    const formattedMemory = manualMemory
-      .map(m => `- ${m.value}`)
-      .join("\n");
-
-    const wantsFull = wantsFullAnswer(message);
-
-    const systemPrompt = `
-You are Codex Brain, Keith's personal AI operating system.
-
-You have two memory sources:
-1. Relevant memory search results.
-2. Recent conversation history.
-
-Use relevant memory first. Recent history is only context.
-If Keith asks about himself, his family, gym, work, personality, preferences, or projects, search memory matters more than recent chat.
-
-Manual long-term memory:
-${formattedMemory || "No manual memory yet."}
-
-Current dispatch system state:
-${JSON.stringify(getDispatchSummary(), null, 2)}
-
-STYLE:
-Talk like Keith's sharp operator brain.
-Direct, human, slightly sarcastic.
-No corporate tone.
-No long speeches unless Keith asks for full detail.
-
-RESPONSE MODE:
-${wantsFull ? "Keith asked for detail. Give a detailed answer." : "Keep it short and sharp."}
-
-RULES:
-- Use relevant memory when it answers the question.
-- Do not say you do not know if relevant memory contains the answer.
-- If Keith asks "what gym do I go to?", answer RAW gym if memory contains it.
-- Do not dump all memory unless Keith asks for the whole detail.
-- If you do not know something, say it plainly.
-- Do not invent live/current facts.
-- For current news, sports, prices, weather, or live events, say you need a live check if not verified.
-`;
-
-    const response = await client.responses.create({
-      model: "gpt-4.1-mini",
-      input: [
-        { role: "system", content: systemPrompt },
-        ...relevantMemory,
-        ...recentHistory,
-        { role: "user", content: message }
-      ]
+    const systemPrompt = buildSystemPrompt({
+      runtimeContext,
+      localMemoryContext,
+      retrievedMemoryContext: memoryContext
     });
 
-    const reply = clean(getReply(response));
+    const completion = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt
+        },
+        {
+          role: "user",
+          content: userMessage
+        }
+      ],
+      temperature: 0.3
+    });
 
-    await saveBrainLog("assistant", reply);
+    const reply = completion.choices?.[0]?.message?.content || "";
 
-    res.json({
+    return res.json({
+      ok: true,
       reply,
-      relevant_memory_hits: relevantMemory.length,
-      saved_to_brain_logs: true
+      response: reply,
+      answer: reply,
+      message: reply,
+      memory_used: memoryUsed,
+      memory_results_count: memoryResults.length,
+      memory_results_preview: memoryResults.slice(0, 5).map((result) => ({
+        conversation_title: result.conversation_title,
+        tags: result.tags,
+        score: result.score,
+        updated_at: result.updated_at
+      }))
+    });
+  } catch (error) {
+    console.error("Chat error:", error);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Chat failed",
+      details: error.message
+    });
+  }
+}
+
+function renderChatPage(req, res) {
+  res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Codex Brain</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(78, 131, 255, 0.16), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(126, 255, 205, 0.08), transparent 35%),
+        #070707;
+      color: #f5f5f5;
+      font-family: Arial, Helvetica, sans-serif;
+      min-height: 100vh;
+    }
+
+    .shell {
+      width: 100%;
+      max-width: 1050px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .brand {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 30px;
+      letter-spacing: -0.04em;
+    }
+
+    .brand p {
+      margin: 0;
+      color: #a7a7a7;
+      font-size: 14px;
+    }
+
+    .status {
+      border: 1px solid rgba(139, 226, 139, 0.35);
+      color: #9cff9c;
+      background: rgba(139, 226, 139, 0.08);
+      padding: 10px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .panel {
+      background: rgba(14, 14, 14, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 22px;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+      overflow: hidden;
+    }
+
+    #messages {
+      min-height: 530px;
+      max-height: 650px;
+      overflow-y: auto;
+      padding: 24px;
+      white-space: pre-wrap;
+      line-height: 1.55;
+    }
+
+    .msg {
+      margin-bottom: 18px;
+      padding: 16px;
+      border-radius: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .user {
+      background: rgba(79, 131, 255, 0.12);
+      color: #dce7ff;
+    }
+
+    .assistant {
+      background: rgba(255, 255, 255, 0.045);
+      color: #f5f5f5;
+    }
+
+    .label {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #9c9c9c;
+      margin-bottom: 8px;
+    }
+
+    .input-wrap {
+      display: flex;
+      gap: 12px;
+      padding: 18px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(0, 0, 0, 0.25);
+    }
+
+    input {
+      flex: 1;
+      background: #0b0b0b;
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 14px;
+      padding: 15px 16px;
+      font-size: 16px;
+      outline: none;
+    }
+
+    input:focus {
+      border-color: rgba(139, 180, 255, 0.75);
+      box-shadow: 0 0 0 4px rgba(139, 180, 255, 0.08);
+    }
+
+    button {
+      background: #ffffff;
+      color: #000000;
+      border: 0;
+      border-radius: 14px;
+      padding: 15px 24px;
+      font-weight: 800;
+      cursor: pointer;
+      font-size: 15px;
+    }
+
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .quick {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 16px 0 0;
+    }
+
+    .quick button {
+      background: rgba(255, 255, 255, 0.08);
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    @media (max-width: 700px) {
+      .shell {
+        padding: 16px;
+      }
+
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .status {
+        white-space: normal;
+      }
+
+      #messages {
+        min-height: 480px;
+        max-height: 620px;
+        padding: 16px;
+      }
+
+      .input-wrap {
+        flex-direction: column;
+      }
+
+      button {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="brand">
+        <h1>Codex Brain</h1>
+        <p>Local memory engine connected to your ChatGPT archive.</p>
+      </div>
+      <div class="status">Backend live on port 3000</div>
+    </div>
+
+    <div class="panel">
+      <div id="messages"></div>
+
+      <div class="input-wrap">
+        <input id="messageInput" placeholder="Ask Codex Brain..." autocomplete="off" />
+        <button id="sendButton">Send</button>
+      </div>
+    </div>
+
+    <div class="quick">
+      <button onclick="quickAsk('where did we leave off with codex brain?')">Codex Brain status</button>
+      <button onclick="quickAsk('where did we leave off with X7?')">X7</button>
+      <button onclick="quickAsk('what did we decide about the dispatch dashboard?')">Dispatch</button>
+      <button onclick="quickAsk('where did we leave off with ARC League?')">ARC League</button>
+      <button onclick="quickAsk('what was the plan for Neuralyx POS?')">Neuralyx POS</button>
+    </div>
+  </div>
+
+  <script>
+    const messages = document.getElementById("messages");
+    const input = document.getElementById("messageInput");
+    const button = document.getElementById("sendButton");
+
+    function addMessage(type, text) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "msg " + type;
+
+      const label = document.createElement("div");
+      label.className = "label";
+      label.textContent = type === "user" ? "Keith" : "Codex Brain";
+
+      const content = document.createElement("div");
+      content.textContent = text;
+
+      wrapper.appendChild(label);
+      wrapper.appendChild(content);
+      messages.appendChild(wrapper);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function sendMessage() {
+      const text = input.value.trim();
+
+      if (!text) return;
+
+      addMessage("user", text);
+
+      input.value = "";
+      button.disabled = true;
+      button.textContent = "Thinking...";
+
+      try {
+        const response = await fetch("/chat", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            message: text
+          })
+        });
+
+        const data = await response.json();
+
+        if (!data.ok) {
+          addMessage("assistant", "Error: " + (data.error || "Unknown error"));
+        } else {
+          addMessage("assistant", data.reply || data.answer || data.message || "No reply returned.");
+        }
+      } catch (error) {
+        addMessage("assistant", "Connection error: " + error.message);
+      }
+
+      button.disabled = false;
+      button.textContent = "Send";
+      input.focus();
+    }
+
+    function quickAsk(text) {
+      input.value = text;
+      sendMessage();
+    }
+
+    button.addEventListener("click", sendMessage);
+
+    input.addEventListener("keydown", function(event) {
+      if (event.key === "Enter") {
+        sendMessage();
+      }
     });
 
-  } catch (err) {
-    console.error("CHAT ERROR:", err);
-    res.status(500).json({
-      error: "Chat failed",
-      details: err.message
+    addMessage("assistant", "Codex Brain is ready. Ask what we left off with, or use one of the quick buttons.");
+  </script>
+</body>
+</html>
+  `);
+}
+
+function initializeServer() {
+  console.log("Starting Codex Brain backend...");
+  console.log("Backend folder:", __dirname);
+
+  if (fs.existsSync(DATA_MEMORY_FILE)) {
+    console.log("Memory archive found:", DATA_MEMORY_FILE);
+  } else {
+    console.warn("Memory archive missing:", DATA_MEMORY_FILE);
+  }
+
+  loadMemory();
+}
+
+initializeServer();
+
+app.get("/", renderChatPage);
+app.get("/chat", renderChatPage);
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    status: "healthy",
+    port: PORT,
+    model: OPENAI_MODEL,
+    openai_key_loaded: Boolean(process.env.OPENAI_API_KEY),
+    memory_file_exists: fs.existsSync(DATA_MEMORY_FILE),
+    local_memory_exists: fs.existsSync(LOCAL_MEMORY_FILE)
+  });
+});
+
+app.post("/memory/search", async (req, res) => {
+  try {
+    const { query, limit = 8 } = req.body || {};
+
+    if (!query || typeof query !== "string") {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing query"
+      });
+    }
+
+    console.log("Memory search for:", query);
+
+    const results = searchMemory(query, limit);
+
+    console.log(`Found ${results.length} memory results`);
+
+    return res.json({
+      ok: true,
+      query,
+      count: results.length,
+      results
+    });
+  } catch (error) {
+    console.error("Memory search error:", error);
+
+    return res.status(500).json({
+      ok: false,
+      error: "Memory search failed",
+      details: error.message
     });
   }
 });
 
-// ===== DISPATCH ROUTES =====
-app.get("/dispatch/create/:id", (req, res) => {
-  res.json(dispatch.createDispatch(req.params.id));
+app.get("/memory/local", (req, res) => {
+  const localMemory = safeReadJson(LOCAL_MEMORY_FILE, []);
+
+  return res.json({
+    ok: true,
+    memory: localMemory
+  });
 });
 
-app.get("/dispatch/update/:id/:status", (req, res) => {
-  res.json(dispatch.updateStatus(req.params.id, req.params.status));
+app.post("/memory/local", (req, res) => {
+  const body = req.body || {};
+
+  const currentMemory = safeReadJson(LOCAL_MEMORY_FILE, []);
+  const memoryArray = Array.isArray(currentMemory) ? currentMemory : [currentMemory];
+
+  const item = {
+    id: Date.now().toString(),
+    created_at: new Date().toISOString(),
+    type: body.type || "note",
+    title: body.title || "Untitled memory",
+    content: body.content || body.message || body.text || "",
+    raw: body
+  };
+
+  memoryArray.push(item);
+
+  const saved = safeWriteJson(LOCAL_MEMORY_FILE, memoryArray);
+
+  if (!saved) {
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to save local memory"
+    });
+  }
+
+  return res.json({
+    ok: true,
+    item,
+    count: memoryArray.length
+  });
 });
 
-app.get("/dispatch/all", (req, res) => {
-  res.json(dispatch.getAllDispatches());
-});
+app.post("/chat", handleChat);
+app.post("/api/chat", handleChat);
 
-app.get("/dispatch/summary", (req, res) => {
-  res.json(getDispatchSummary());
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: "Route not found",
+    path: req.path
+  });
 });
-
-// ===== START =====
-const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Codex Brain backend running on http://localhost:${PORT}`);
 });
